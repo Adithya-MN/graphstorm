@@ -266,6 +266,169 @@ class GSNodeEncoderInputLayer(GSNodeInputLayer):
         """
         return self.embed_size
 
+class GSNodeEncoderCustomInputLayer(GSNodeInputLayer):
+    """The input encoder layer for all nodes in a heterogeneous graph.
+
+    The input layer adds learnable embeddings on nodes if the nodes do not have features.
+    It adds a linear layer on nodes with node features and the linear layer projects the node
+    features to a specified dimension. A user can add learnable embeddings on the nodes
+    with node features. In this case, the input layer combines the node features with
+    the learnable embeddings and project them to the specified dimension.
+
+    Parameters
+    ----------
+    g: DistGraph
+        The distributed graph
+    feat_size : dict of int
+        The original feat sizes of each node type
+    embed_size : int
+        The embedding size
+    activation : func
+        The activation function
+    dropout : float
+        The dropout parameter
+    use_node_embeddings : bool
+        Whether we will use the node embeddings for individual nodes even when node features are
+        available.
+    """
+    def __init__(self,
+                 g,
+                 feat_size,
+                 embed_size,
+                 activation=None,
+                 dropout=0.0,
+                 use_node_embeddings=False):
+        super(GSNodeEncoderInputLayer, self).__init__(g)
+        self.embed_size = embed_size
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout)
+        self.use_node_embeddings = use_node_embeddings
+
+        # create weight embeddings for each node for each relation
+        self.proj_matrix = nn.ParameterDict()
+        self.input_projs = nn.ParameterDict()
+        embed_name = 'embed'
+        for ntype in g.ntypes:
+            feat_dim = 0
+            if feat_size[ntype] > 0:
+                feat_dim += feat_size[ntype]
+            if feat_dim > 0:
+                if get_rank() == 0:
+                    print('Node {} has {} features.'.format(ntype, feat_dim))
+
+                if(ntype == "user"):
+                    self.ip3o_embedding_layer = th.nn.Embedding(3000000, 12)
+                    self.ua_embedding_layer = th.nn.Embedding(800000, 8)
+                    feat_dim = feat_dim + 18
+                    
+                input_projs = nn.Parameter(th.Tensor(feat_dim, self.embed_size))
+                nn.init.xavier_uniform_(input_projs, gain=nn.init.calculate_gain('relu'))
+                self.input_projs[ntype] = input_projs
+                if self.use_node_embeddings:
+                    if get_rank() == 0:
+                        print('Use additional sparse embeddings on node {}'.format(ntype))
+                    part_policy = g.get_node_partition_policy(ntype)
+                    self._sparse_embeds[ntype] = DistEmbedding(g.number_of_nodes(ntype),
+                                                               self.embed_size,
+                                                               embed_name + '_' + ntype,
+                                                               init_emb,
+                                                               part_policy)
+                    proj_matrix = nn.Parameter(th.Tensor(2 * self.embed_size, self.embed_size))
+                    nn.init.xavier_uniform_(proj_matrix, gain=nn.init.calculate_gain('relu'))
+                    # nn.ParameterDict support this assignment operation if not None,
+                    # so disable the pylint error
+                    self.proj_matrix[ntype] = proj_matrix   # pylint: disable=unsupported-assignment-operation
+            else:
+                part_policy = g.get_node_partition_policy(ntype)
+                if get_rank() == 0:
+                    print(f'Use sparse embeddings on node {ntype}:{g.number_of_nodes(ntype)}')
+                proj_matrix = nn.Parameter(th.Tensor(self.embed_size, self.embed_size))
+                nn.init.xavier_uniform_(proj_matrix, gain=nn.init.calculate_gain('relu'))
+                self.proj_matrix[ntype] = proj_matrix
+                self._sparse_embeds[ntype] = DistEmbedding(g.number_of_nodes(ntype),
+                                self.embed_size,
+                                embed_name + '_' + ntype,
+                                init_emb,
+                                part_policy=part_policy)
+
+    def forward(self, input_feats, input_nodes):
+        """Forward computation
+
+        Parameters
+        ----------
+        input_feats: dict
+            input features
+        input_nodes: dict
+            input node ids
+
+        Returns
+        -------
+        a dict of Tensor: the node embeddings.
+        """
+        assert isinstance(input_feats, dict), 'The input features should be in a dict.'
+        assert isinstance(input_nodes, dict), 'The input node IDs should be in a dict.'
+        embs = {}
+        for ntype in input_nodes:
+            if ntype in input_feats:
+                assert ntype in self.input_projs, \
+                        f"We need a projection for node type {ntype}"
+                # If the input data is not float, we need to convert it t float first.
+                if(ntype == "user"):
+
+                    ip3o_indices = input_feats["user"][:, -2].long()
+                    ua_indices = input_feats["user"][:, -1].long()
+
+                    ip3o_embedding = self.ip3o_embedding_layer(ip3o_indices)
+                    ua_embedding = self.ua_embedding_layer(ua_indices)
+
+                    initial_input_wout_embed = input_feats["user"][:, :-2].float()
+                    initial_input = th.cat([initial_input_wout_embed, ip3o_embedding, ua_embedding], dim = 1)
+                else:
+                    initial_input = input_feats[ntype].float()
+
+                emb = initial_input @ self.input_projs[ntype]
+                if self.use_node_embeddings:
+                    assert ntype in self.sparse_embeds, \
+                            f"We need sparse embedding for node type {ntype}"
+                    node_emb = self.sparse_embeds[ntype](input_nodes[ntype], emb.device)
+                    concat_emb=th.cat((emb, node_emb),dim=1)
+                    emb = concat_emb @ self.proj_matrix[ntype]
+            else: # nodes do not have input features
+                # If the number of the input node of a node type is 0,
+                # return an empty tensor with shape (0, emb_size)
+                device = self.proj_matrix[ntype].device
+                if len(input_nodes[ntype]) == 0:
+                    dtype = self.sparse_embeds[ntype].weight.dtype
+                    embs[ntype] = th.zeros((0, self.sparse_embeds[ntype].embedding_dim),
+                                           device=device, dtype=dtype)
+                    continue
+                emb = self.sparse_embeds[ntype](input_nodes[ntype], device)
+                emb = emb @ self.proj_matrix[ntype]
+            if self.activation is not None:
+                emb = self.activation(emb)
+            emb = self.dropout(emb)
+            embs[ntype] = emb
+
+        return embs
+
+    def get_sparse_params(self):
+        """ get the sparse parameters.
+
+        Returns
+        -------
+        list of Tensors: the sparse embeddings.
+        """
+        if self.sparse_embeds is not None and len(self.sparse_embeds) > 0:
+            return list(self.sparse_embeds.values())
+        else:
+            return []
+
+    @property
+    def out_dims(self):
+        """ The number of output dimensions.
+        """
+        return self.embed_size    
+    
 def compute_node_input_embeddings(g, batch_size, embed_layer,
                                   task_tracker=None, feat_field='feat'):
     """

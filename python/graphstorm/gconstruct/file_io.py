@@ -23,9 +23,14 @@ import os
 
 import pyarrow.parquet as pq
 import pyarrow as pa
+import pandas as pd
 import numpy as np
 import torch as th
 import h5py
+from typing import Dict
+
+def astype_inplace(df: pd.DataFrame, dct: Dict):
+    df[list(dct.keys())] = df.astype(dct)[list(dct.keys())]
 
 def read_data_json(data_file, data_fields):
     """ Read data from a JSON file.
@@ -115,31 +120,63 @@ def read_data_parquet(data_file, data_fields=None):
         data[key] = d
     return data
 
-def write_data_parquet(data, data_file):
-    """ Write data in parquet files.
+def read_data_parquet(data_file, data_fields=None):
+    """ Read data from a parquet file.
 
-    Normally, Parquet cannot support multi-dimension arrays.
-    This function splits a multi-dimensiion array into N arrays
-    (each row is an array) and store the arrays as objects in the parquet file.
+    A row of a multi-dimension data is stored as an object in Parquet.
+    We need to stack them to form a tensor.
 
     Parameters
     ----------
-    data : dict
-        The data to be saved to the Parquet file.
     data_file : str
-        The file name of the Parquet file.
+        The parquet file that contains the data
+    data_fields : list of str
+        The data fields to read from the data file.
+
+    Returns
+    -------
+    dict : map from data name to data.
     """
-    arr_dict = {}
-    for key in data:
-        arr = data[key]
-        assert len(arr.shape) == 1 or len(arr.shape) == 2, \
-                "We can only write a vector or a matrix to a parquet file."
-        if len(arr.shape) == 1:
-            arr_dict[key] = arr
+    table = pq.read_table(data_file)
+    data = {}
+    df_table = table.to_pandas()
+
+    df_columns = df_table.columns
+    if "supply_index" in df_columns:
+        if "feats" in df_table.columns:
+            df_table["feats"] = df_table['feats'].apply(np.float16)
+
+    mapping_dict = {}
+    remap = False
+    for index, dtype in df_table.dtypes.items():
+
+        #if(dtype == "float32"):
+        #    mapping_dict[index] = "float16"
+
+        if(index.endswith("_mask")):
+            mapping_dict[index] = "int8"
+            remap = True
+
+    if(remap):
+        astype_inplace(df_table, mapping_dict)
+
+    if data_fields is None:
+        data_fields = list(df_table.keys())
+    for key in data_fields:
+        assert key in df_table, f"The data field {key} does not exist in {data_file}."
+        val = df_table[key]
+        d = np.array(val)
+        # For multi-dimension arrays, we split them by rows and
+        # save them as objects in parquet. We need to merge them
+        # together and store them in a tensor.
+        if d.dtype.hasobject and isinstance(d[0], np.ndarray):
+            d = [d[i] for i in range(len(d))]
+            d = np.stack(d)
+        if ("supply_index" in df_columns) and ("feats" in df_columns):
+            data[key] = d.astype(np.float16)
         else:
-            arr_dict[key] = [arr[i] for i in range(len(arr))]
-    table = pa.Table.from_arrays(list(arr_dict.values()), names=list(arr_dict.keys()))
-    pq.write_table(table, data_file)
+            data[key] = d
+    return data
 
 class HDF5Handle:
     """ HDF5 file handle

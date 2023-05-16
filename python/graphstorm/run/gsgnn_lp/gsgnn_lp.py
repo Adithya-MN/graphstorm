@@ -103,7 +103,7 @@ def main(args):
             f'[{BUILTIN_LP_UNIFORM_NEG_SAMPLER}, {BUILTIN_LP_JOINT_NEG_SAMPLER}]')
     val_dataloader = test_dataloader_cls(train_data, train_data.val_idxs,
         config.eval_batch_size, config.num_negative_edges_eval)
-    test_dataloader = test_dataloader_cls(train_data, train_data.test_idxs,
+    test_dataloader = test_dataloader_cls(train_data, train_data.train_idxs,
         config.eval_batch_size, config.num_negative_edges_eval)
 
     # Preparing input layer for training or inference.
