@@ -30,7 +30,6 @@ from .config import BUILTIN_LP_DOT_DECODER
 from .config import BUILTIN_LP_DISTMULT_DECODER
 from .model.embed import GSNodeEncoderInputLayer
 from .model.embed import GSNodeEncoderCustomInputLayer
-
 from .model.lm_embed import GSLMNodeEncoderInputLayer, GSPureLMNodeInputLayer
 from .model.rgcn_encoder import RelationalGCNEncoder
 from .model.rgat_encoder import RelationalGATEncoder
@@ -371,9 +370,10 @@ def set_encoder(model, g, config, train_task):
                                                 dropout=config.dropout,
                                                 use_node_embeddings=config.use_node_embeddings)
     else:
-        encoder = GSNodeEncoderInputLayer(g, feat_size, config.hidden_size,
-                                          dropout=config.dropout,
-                                          use_node_embeddings=config.use_node_embeddings)
+        print("Using Custom Layer")
+        encoder = GSNodeEncoderCustomInputLayer(g, feat_size, config.hidden_size,
+                            dropout=config.dropout,
+                            use_node_embeddings=config.use_node_embeddings)
     model.set_node_input_encoder(encoder)
 
     # Set GNN encoders
